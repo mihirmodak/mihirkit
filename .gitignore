@@ -175,3 +175,6 @@ cython_debug/
 
 # MacOS File
 .DS_Store
+
+# Bandit Report File
+bandit-report.*
