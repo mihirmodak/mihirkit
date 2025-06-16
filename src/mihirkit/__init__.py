@@ -54,12 +54,16 @@ Dependencies:
     Optional: pandas, numpy, sqlalchemy, python-dotenv (for specific features)
 """
 
+# Allow for lazy loading of modules and attributes
 import importlib
 
 _module_exports = {
     # Import Name: ('.' + File Name, Class / Function Name)
+    # Algortihms submodule
+    "algorithms": (".algorithms", None),
     # Database
     "Database": (".db", "Database"),
+    "QueryCache": (".db", "QueryCache"),
     # decorators
     "DisabledMethodError": (".decorators", "DisabledMethodError"),
     "disabled": (".decorators", "disabled"),
@@ -91,18 +95,25 @@ def __getattr__(name):
 
     if name in _module_exports:
         module_path, attr_name = _module_exports[name]
-        module = importlib.import_module(module_path, __name__)
 
-    # Get the attribute from the module
-    try:
-        attr = getattr(module, attr_name)
-    except AttributeError as err:
-        raise ImportError(
-            f"Cannot import name '{attr_name} from '{module_path}''"
-        ) from err
+        # Special handling for submodules
+        if attr_name is None:
+            # This is a submodule, import it directly
+            module = importlib.import_module(module_path, __name__)
+            attr = module
+        else:
+            # This is a regular import
+            module = importlib.import_module(module_path, __name__)
+            try:
+                attr = getattr(module, attr_name)
+            except AttributeError as err:
+                raise ImportError(
+                    f"Cannot import name '{attr_name}' from '{module_path}'"
+                ) from err
 
     # Cache the attribute in this module
-    globals()[name] = attr
+    if attr is not None:
+        globals()[name] = attr
 
     if attr is None:
         raise AttributeError(f"Module '{__name__}' has no attribute '{name}'")

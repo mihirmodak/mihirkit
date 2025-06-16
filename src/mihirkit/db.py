@@ -133,8 +133,7 @@ Note:
 import json
 import re
 import warnings
-from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 import sqlalchemy
@@ -143,6 +142,216 @@ from sqlalchemy import Connection as SQLAlchemyConnection
 from sqlalchemy import Engine as SQLAlchemyEngine
 from sqlalchemy.orm import Session as SQLAlchemySession
 from sqlalchemy.orm import sessionmaker as SQLAlchemySessionMaker
+
+
+class QueryCache:
+    """
+    A simple caching system for database query results.
+
+    The cache maps query arguments (converted to hashable form) to query results.
+    This is designed to be used manually within database methods rather than as a decorator.
+
+    Features:
+        - Converts unhashable arguments (dicts, lists) to hashable tuples for cache keys
+        - Configurable cache size with automatic LRU eviction
+        - Manual cache management (get, put, clear, stats)
+        - Simple argument → result mapping
+
+    Example:
+        ```python
+        class Database:
+            def __init__(self):
+                self.cache = QueryCache(maxsize=128)
+
+            def select(self, table, where=None, order_by=None):
+                # Check cache first
+                cache_key = self.cache.create_key(table=table, where=where, order_by=order_by)
+                cached_result = self.cache.get(cache_key)
+                if cached_result is not None:
+                    return cached_result
+
+                # Execute query
+                result = self._execute_query(...)
+
+                # Cache the result
+                self.cache.put(cache_key, result)
+                return result
+        ```
+    """
+
+    def __init__(self, maxsize: int = 128):
+        """
+        Initialize the QueryCache.
+
+        Args:
+            maxsize: Maximum number of cached query results
+        """
+        self.maxsize = maxsize
+        self._cache: Dict[Tuple, Any] = {}
+        self._access_order: List[Tuple] = []  # Track access order for LRU eviction
+
+    def _make_hashable(self, obj: Any) -> Any:
+        """
+        Convert unhashable objects to hashable equivalents for caching.
+
+        Args:
+            obj: Object to convert (dict, list, or any other type)
+
+        Returns:
+            Hashable equivalent of the input object
+        """
+        if obj is None:
+            return None
+        elif isinstance(obj, dict):
+            # Convert dict to sorted tuple of (key, value) pairs
+            return tuple(sorted((k, self._make_hashable(v)) for k, v in obj.items()))
+        elif isinstance(obj, list):
+            # Convert list to tuple, recursively making each element hashable
+            return tuple(self._make_hashable(item) for item in obj)
+        elif isinstance(obj, tuple):
+            # Tuple is already hashable, but items might not be
+            return tuple(self._make_hashable(item) for item in obj)
+        elif isinstance(obj, set):
+            # Convert set to sorted tuple
+            return tuple(sorted(self._make_hashable(item) for item in obj))
+        else:
+            # For primitive types (int, str, bool, etc.) and other hashable types
+            try:
+                # Test if the object is hashable
+                hash(obj)
+                return obj
+            except TypeError:
+                # If not hashable, convert to string representation
+                return str(obj)
+
+    def create_key(self, **kwargs) -> Tuple:
+        """
+        Create a hashable cache key from keyword arguments.
+
+        Args:
+            **kwargs: The arguments to create a cache key from
+
+        Returns:
+            Hashable tuple representing the unique cache key
+
+        Example:
+            ```python
+            cache = QueryCache()
+            key = cache.create_key(table="users", where={"active": True}, limit=10)
+            ```
+        """
+        # Convert kwargs to hashable form, maintaining sorted order for consistency
+        hashable_kwargs = tuple(
+            sorted((k, self._make_hashable(v)) for k, v in kwargs.items())
+        )
+        return hashable_kwargs
+
+    def get(self, cache_key: Tuple) -> Optional[Any]:
+        """
+        Get a cached result by cache key.
+
+        Args:
+            cache_key: The cache key (typically created by create_key())
+
+        Returns:
+            Cached result if found, None otherwise
+
+        Example:
+            ```python
+            cache = QueryCache()
+            key = cache.create_key(table="users", where={"id": 1})
+            result = cache.get(key)  # Returns None if not cached
+            ```
+        """
+        if cache_key in self._cache:
+            # Update access order for LRU
+            self._update_access_order(cache_key)
+            return self._cache[cache_key]
+        return None
+
+    def put(self, cache_key: Tuple, result: Any) -> None:
+        """
+        Store a result in the cache.
+
+        Args:
+            cache_key: The cache key (typically created by create_key())
+            result: The result to cache
+
+        Example:
+            ```python
+            cache = QueryCache()
+            key = cache.create_key(table="users", where={"id": 1})
+            cache.put(key, [{"id": 1, "name": "John"}])
+            ```
+        """
+        self._cache[cache_key] = result
+        self._update_access_order(cache_key)
+
+        # Manage cache size with LRU eviction
+        self._evict_lru_entries()
+
+    def _update_access_order(self, key: Tuple) -> None:
+        """Update the access order for LRU eviction."""
+        if key in self._access_order:
+            self._access_order.remove(key)
+        self._access_order.append(key)
+
+    def _evict_lru_entries(self) -> None:
+        """Remove least recently used entries when cache exceeds maxsize."""
+        while len(self._cache) > self.maxsize:
+            # Remove the least recently used entry
+            lru_key = self._access_order.pop(0)
+            if lru_key in self._cache:
+                del self._cache[lru_key]
+
+    def contains(self, cache_key: Tuple) -> bool:
+        """
+        Check if a cache key exists in the cache.
+
+        Args:
+            cache_key: The cache key to check
+
+        Returns:
+            True if the key exists, False otherwise
+        """
+        return cache_key in self._cache
+
+    def clear(self) -> None:
+        """
+        Clear all cached results.
+
+        Example:
+            ```python
+            cache = QueryCache()
+            cache.clear()  # Remove all cached results
+            ```
+        """
+        self._cache.clear()
+        self._access_order.clear()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about cached queries.
+
+        Returns:
+            Dictionary containing cache statistics
+
+        Example:
+            ```python
+            cache = QueryCache()
+            stats = cache.get_stats()
+            print(f"Cache contains {stats['size']} queries")
+            print(f"Cache utilization: {stats['utilization']:.1%}")
+            ```
+        """
+        return {
+            "size": len(self._cache),
+            "maxsize": self.maxsize,
+            "utilization": len(self._cache) / self.maxsize if self.maxsize > 0 else 0,
+            "hit_ratio": getattr(self, "_hits", 0)
+            / max(getattr(self, "_attempts", 1), 1),
+            "sample_keys": list(self._cache.keys())[:3],  # First 3 keys for debugging
+        }
 
 
 class Database:
@@ -177,8 +386,13 @@ class Database:
     session_maker: SQLAlchemySessionMaker
     session: SQLAlchemySession
     connection: SQLAlchemyConnection
+    cache: QueryCache
 
-    def __init__(self, config: str | Dict[str, Any] = "sqlite+pysqlite:///:memory:"):
+    def __init__(
+        self,
+        config: str | Dict[str, Any] = "sqlite+pysqlite:///:memory:",
+        cache_size: int = 128,
+    ):
         """
         Initialize database connection with flexible configuration support.
 
@@ -214,6 +428,7 @@ class Database:
         self.session_maker = sqlalchemy.orm.sessionmaker(bind=self.engine)
         self.session = self.session_maker()
         self.connection = self.session.connection()
+        self.cache = QueryCache(maxsize=cache_size)
 
     @property
     def cursor(self) -> Any:
@@ -550,6 +765,14 @@ class Database:
 
         return not self.connection.closed
 
+    def clear_cache(self) -> None:
+        """Clear the query cache for this database instance."""
+        self.cache.clear()
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for this database instance."""
+        return self.cache.get_stats()
+
     def _sanitize_identifier(self, identifier: str) -> str:
         """
         Sanitize SQL identifiers (table and column names) to prevent injection attacks.
@@ -660,7 +883,96 @@ class Database:
         if hasattr(self, "engine") and self.engine:
             self.engine.dispose()
 
-    @lru_cache
+    def create_table(
+        self,
+        table: str,
+        columns: Dict[str, str],
+        if_not_exists: bool = True,
+        primary_key: Optional[List[str]] = None,
+        unique: Optional[List[str]] = None,
+        foreign_keys: Optional[List[Dict[str, str]]] = None,
+        indexes: Optional[List[List[str]]] = None,
+    ) -> str:
+        """
+        Create a new table in the database with specified columns and constraints.
+
+        Args:
+            table: Name of the table to create
+            columns: Dictionary mapping column names to SQL data types (e.g., {"id": "INTEGER", "name": "VARCHAR(100)"})
+            if_not_exists: If True, adds IF NOT EXISTS to the CREATE TABLE statement
+            primary_key: List of column names to use as primary key
+            unique: List of column names to enforce UNIQUE constraint
+            foreign_keys: List of foreign key definitions, each as dict with keys: column, ref_table, ref_column, on_delete (optional)
+            indexes: List of lists, each inner list is columns to index together
+
+        Returns:
+            str: Success message indicating table creation
+
+        Raises:
+            ValueError: If columns dict is empty or invalid
+            SQLAlchemyError: If table creation fails
+
+        Example:
+            ```python
+            db.create_table(
+                "users",
+                columns={"id": "INTEGER", "name": "TEXT", "email": "TEXT"},
+                primary_key=["id"],
+                unique=["email"]
+            )
+            ```
+        """
+        if not columns or not isinstance(columns, dict):
+            raise ValueError("The `columns` argument must be a non-empty dictionary.")
+
+        # Sanitize table and column names
+        table_name = self._sanitize_identifier(table)
+        col_defs = []
+        for col, col_type in columns.items():
+            col_name = self._sanitize_identifier(col)
+            col_defs.append(f"{col_name} {col_type}")
+
+        # Primary key
+        if primary_key:
+            pk_cols = [self._sanitize_identifier(col) for col in primary_key]
+            col_defs.append(f"PRIMARY KEY ({', '.join(pk_cols)})")
+
+        # Unique constraint
+        if unique:
+            uq_cols = [self._sanitize_identifier(col) for col in unique]
+            col_defs.append(f"UNIQUE ({', '.join(uq_cols)})")
+
+        # Foreign keys
+        if foreign_keys:
+            for fk in foreign_keys:
+                col = self._sanitize_identifier(fk["column"])
+                ref_table = self._sanitize_identifier(fk["ref_table"])
+                ref_col = self._sanitize_identifier(fk["ref_column"])
+                fk_clause = f"FOREIGN KEY ({col}) REFERENCES {ref_table}({ref_col})"
+                if "on_delete" in fk:
+                    fk_clause += f" ON DELETE {fk['on_delete'].upper()}"
+                col_defs.append(fk_clause)
+
+        # Compose CREATE TABLE statement
+        if_not_exists_sql = "IF NOT EXISTS " if if_not_exists else ""
+        create_stmt = f"CREATE TABLE {if_not_exists_sql}{table_name} (\n  {',\n  '.join(col_defs)}\n)"
+
+        # Execute CREATE TABLE
+        self.connection.execute(sqlalchemy.text(create_stmt))
+
+        # Create indexes if specified
+        if indexes:
+            for idx_cols in indexes:
+                idx_cols_sanitized = [
+                    self._sanitize_identifier(col) for col in idx_cols
+                ]
+                idx_name = f"idx_{table_name}_{'_'.join(idx_cols_sanitized)}"
+                idx_stmt = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table_name} ({', '.join(idx_cols_sanitized)})"
+                self.connection.execute(sqlalchemy.text(idx_stmt))
+
+        self.connection.commit()
+        return f"Table `{table_name}` created successfully."
+
     def select(
         self,
         table: str,
@@ -671,57 +983,42 @@ class Database:
         having: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        ignore_cache: bool = False,
     ) -> List[Dict]:
         """
-        Execute SELECT query with advanced filtering, sorting, and aggregation options.
-
-        Provides comprehensive SELECT functionality with WHERE clauses, sorting, grouping,
-        pagination, and result limiting. Results are cached using LRU cache for performance.
+        Execute SELECT query with manual caching support.
 
         Args:
             table: Target table name for the query
             columns: List of column names to select (None for all columns)
             where: Dictionary of column-value pairs for WHERE clause conditions
             order_by: Sorting specification - string for single column or list of dicts
-                     for multiple columns with directions
             group_by: Column name(s) for GROUP BY clause (string or list)
             having: Dictionary of column-value pairs for HAVING clause (requires group_by)
             limit: Maximum number of rows to return
-            offset: Number of rows to skip (requires limit for MySQL)
+            offset: Number of rows to skip
 
         Returns:
             List[Dict]: Query results as list of dictionaries with column names as keys
-
-        Raises:
-            ValueError: If parameters are invalid (e.g., HAVING without GROUP BY)
-            SQLAlchemyError: If query execution fails
-
-        Example:
-            ```python
-            # Basic select
-            users = db.select("users")
-
-            # Select with conditions and sorting
-            active_users = db.select(
-                "users",
-                columns=["id", "name", "email"],
-                where={"active": True, "role": "admin"},
-                order_by=[
-                    {"column": "created_at", "direction": "DESC"},
-                    {"column": "name", "direction": "ASC"}
-                ],
-                limit=10
-            )
-
-            # Aggregation query
-            stats = db.select(
-                "orders",
-                columns=["user_id", "COUNT(*) as order_count", "SUM(total) as total_spent"],
-                group_by="user_id",
-                having={"order_count": 5}
-            )
-            ```
         """
+        # Create cache key from all arguments
+        cache_key = self.cache.create_key(
+            table=table,
+            columns=columns,
+            where=where,
+            order_by=order_by,
+            group_by=group_by,
+            having=having,
+            limit=limit,
+            offset=offset,
+        )
+
+        # Check if result is already cached
+        cached_result = self.cache.get(cache_key)
+        if cached_result is not None and not ignore_cache:
+            return cached_result
+
+        # Execute the query (your existing implementation)
         # Validate HAVING clause can only be used with GROUP BY
         if having and not group_by:
             raise ValueError("HAVING clause can only be used with GROUP BY")
@@ -734,7 +1031,6 @@ class Database:
         if offset is not None:
             if not isinstance(offset, int) or offset < 0:
                 raise ValueError(f"OFFSET must be a non-negative integer, got {offset}")
-            # OFFSET requires LIMIT in MySQL
             if limit is None and "mysql" in self.config.get("DRIVER", "").lower():
                 raise ValueError("OFFSET can only be used with LIMIT in MySQL")
 
@@ -744,7 +1040,6 @@ class Database:
         # Build columns
         column_elements = [sqlalchemy.text("*")]
         if columns is not None and isinstance(columns, (list, tuple, set)):
-            # Sanitize column names
             sanitized_columns = [self._sanitize_identifier(col) for col in columns]
             column_elements = [sqlalchemy.text(col) for col in sanitized_columns]
 
@@ -761,18 +1056,14 @@ class Database:
         if where:
             where_conditions = []
             for col, val in where.items():
-                # Sanitize column name and validate value
                 col = self._sanitize_identifier(col)
-                self._sanitize_value(val)  # Just for validation
-
-                # Create unique parameter name
+                self._sanitize_value(val)
                 param_name = f"where_{param_count}"
                 where_conditions.append(sqlalchemy.text(f"{col} = :{param_name}"))
                 params[param_name] = val
                 param_count += 1
 
             if where_conditions:
-                # Combine conditions with AND
                 combined_condition = sqlalchemy.text(
                     " AND ".join([str(condition) for condition in where_conditions])
                 )
@@ -783,7 +1074,6 @@ class Database:
             if isinstance(group_by, str):
                 group_by = [group_by]
 
-            # Sanitize group by columns
             sanitized_group_by = [self._sanitize_identifier(col) for col in group_by]
             statement = statement.group_by(
                 *[sqlalchemy.text(col) for col in sanitized_group_by]
@@ -793,18 +1083,14 @@ class Database:
             if having:
                 having_conditions = []
                 for col, val in having.items():
-                    # Sanitize column name and validate value
                     col = self._sanitize_identifier(col)
-                    self._sanitize_value(val)  # Just for validation
-
-                    # Create unique parameter name
+                    self._sanitize_value(val)
                     param_name = f"having_{param_count}"
                     having_conditions.append(sqlalchemy.text(f"{col} = :{param_name}"))
                     params[param_name] = val
                     param_count += 1
 
                 if having_conditions:
-                    # Combine conditions with AND
                     combined_condition = sqlalchemy.text(
                         " AND ".join(
                             [str(condition) for condition in having_conditions]
@@ -815,11 +1101,9 @@ class Database:
         # Add ORDER BY clause
         if order_by:
             if isinstance(order_by, str):
-                # Simple case: just a column name (default to ASC)
                 sanitized_col = self._sanitize_identifier(order_by)
                 statement = statement.order_by(sqlalchemy.text(sanitized_col))
             else:
-                # List of dicts with column and direction
                 order_clauses = []
                 for item in order_by:
                     if not isinstance(item, dict) or "column" not in item:
@@ -827,10 +1111,7 @@ class Database:
                             "Each ORDER BY item must be a dict with 'column' key"
                         )
 
-                    # Sanitize column name
                     col = self._sanitize_identifier(item["column"])
-
-                    # Validate direction if provided
                     direction = item.get("direction", "ASC").upper()
                     if direction not in ["ASC", "DESC"]:
                         raise ValueError(
@@ -850,8 +1131,13 @@ class Database:
         # Execute query with parameters
         result = self.connection.execute(statement, params)
 
-        # Return results as list of dictionaries
-        return [dict(row._mapping) for row in result]
+        # Convert results to list of dictionaries
+        query_results = [dict(row._mapping) for row in result]
+
+        # Cache the results
+        self.cache.put(cache_key, query_results)
+
+        return query_results
 
     def insert(
         self,
@@ -859,6 +1145,7 @@ class Database:
         data: Optional[list | dict | pd.DataFrame] = None,
         columns: Optional[List[str]] = None,
         values: Optional[List[List[Any]]] = None,
+        **kwargs: Any,
     ) -> str:
         """
         Insert data into database table using traditional or bulk methods.
@@ -901,16 +1188,16 @@ class Database:
             ```
         """
         if data is not None:
-            return self._bulk_insert(table, data)
+            return self._bulk_insert(table, data, **kwargs)
         elif columns and values:
-            return self._single_insert(table, columns, values)
+            return self._single_insert(table, columns, values, **kwargs)
         else:
             raise ValueError(
                 "Either the `data` argument or the `columns` and `values` arguments must be provdided."
             )
 
     def _single_insert(
-        self, table: str, columns: List[str], values: List[List[Any]]
+        self, table: str, columns: List[str], values: List[List[Any]], **kwargs: Any
     ) -> str:
         """
         Insert rows using traditional column-value list method.
@@ -962,7 +1249,12 @@ class Database:
         return f"Query Result: {row_count} rows inserted."
 
     def _bulk_insert(
-        self, table: str, data: List[Any] | Dict[str, Any] | pd.DataFrame, **kwargs
+        self,
+        table: str,
+        data: List[Dict[str, Any]] | Dict[str, list[Any]] | pd.DataFrame,
+        if_exists: Literal["fail", "replace", "append"] = "fail",
+        index: bool = False,
+        **kwargs: Any,
     ) -> str:
         """
         Insert data using pandas DataFrame bulk operations for improved performance.
@@ -999,9 +1291,21 @@ class Database:
                 f"The `data` argument must be either a dictionary, a list of dictionaries, or a pandas DataFrame. Found {type(data)} instead."
             )
 
-        data = pd.DataFrame(data)
+        match data:
+            case pd.DataFrame():
+                pass
+            case dict():
+                data = pd.DataFrame([data])  # Convert single dict to DataFrame
+            case list():
+                if not all(isinstance(row, dict) for row in data):
+                    raise TypeError(
+                        "All items in the list must be dictionaries. Found non-dictionary item."
+                    )
+                data = pd.DataFrame(data)  # Convert list of dicts to DataFrame
 
-        data.to_sql(name=table, con=self.engine, **kwargs)
+        data.to_sql(
+            name=table, con=self.engine, if_exists=if_exists, index=index, **kwargs
+        )
 
         return f"Query Result: {len(data)} rows inserted."
 
